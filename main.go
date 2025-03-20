@@ -2,400 +2,247 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
+	"flag"
 	"os"
-	"strconv"
-	"strings"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
-// Config holds all configuration options
-type Config struct {
-	// Redis connection details
-	RedisAddr     string
-	RedisPassword string
-	RedisDB       int
+func main() {
+	// Define command line flags
+	var proxyOnly bool
+	var dashboardOnly bool
 
-	// HTTP server settings
-	Port int
+	flag.BoolVar(&proxyOnly, "proxy-only", false, "Run only the proxy server")
+	flag.BoolVar(&dashboardOnly, "dashboard-only", false, "Run only the dashboard server")
+	flag.Parse()
 
-	// Proxy behavior settings
-	FixedTopic               string // If set, all messages go to this topic
-	RespondImmediatelyStatus int    // If set, respond immediately with this status code
-	ResponseTimeout          int    // Timeout in seconds for waiting for a response
+	// Load configuration
+	proxyConfig := LoadConfigFromEnv()
+	dashboardConfig := LoadDashboardConfigFromEnv()
 
-	// Debug mode
-	Debug bool
-}
+	// Configure zerolog
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 
-// Message represents the format of messages sent to Redis
-type Message struct {
-	Header map[string]interface{} `json:"header"`
-	Body   interface{}            `json:"body"`
-}
+	// Determine log level - use highest verbosity level from either config
+	logLevel := proxyConfig.LogLevel
+	if dashboardConfig.LogLevel < logLevel {
+		logLevel = dashboardConfig.LogLevel
+	}
+	zerolog.SetGlobalLevel(logLevel)
 
-// Response represents the expected response format from Redis
-type Response struct {
-	Body interface{} `json:"body"`
-}
-
-// LoadConfigFromEnv loads configuration from environment variables
-func LoadConfigFromEnv() Config {
-	config := Config{
-		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
-		RedisPassword:   getEnv("REDIS_PASSWORD", ""),
-		Port:            getEnvAsInt("PORT", 8080),
-		ResponseTimeout: getEnvAsInt("RESPONSE_TIMEOUT", 30),
-		Debug:           getEnvAsBool("DEBUG", false),
+	// Use pretty logging for development
+	if proxyConfig.Debug || dashboardConfig.Debug || logLevel == zerolog.DebugLevel || logLevel == zerolog.TraceLevel {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
 	}
 
-	// Parse Redis DB
-	redisDB, err := strconv.Atoi(getEnv("REDIS_DB", "0"))
-	if err == nil {
-		config.RedisDB = redisDB
+	// Initialize DB logger if enabled
+	var dbLogger *DBLogger
+	var err error
+
+	dbLogPath := proxyConfig.DBLogPath
+	dbMaxEntries := proxyConfig.DBMaxEntries
+
+	// If dashboard only, use dashboard config values
+	if dashboardOnly && !proxyOnly {
+		dbLogPath = dashboardConfig.DBLogPath
 	}
 
-	// Optional fixed topic
-	config.FixedTopic = getEnv("FIXED_TOPIC", "")
-
-	// Optional immediate response status code
-	respondStatus := getEnv("RESPOND_IMMEDIATELY_STATUS_CODE", "")
-	if respondStatus != "" {
-		statusCode, err := strconv.Atoi(respondStatus)
-		if err == nil {
-			config.RespondImmediatelyStatus = statusCode
-		}
-	}
-
-	return config
-}
-
-// Helper function to get environment variable with a default value
-func getEnv(key, defaultValue string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
-	}
-	return value
-}
-
-// Helper function to get environment variable as int with a default value
-func getEnvAsInt(key string, defaultValue int) int {
-	valueStr := getEnv(key, "")
-	if valueStr == "" {
-		return defaultValue
-	}
-	value, err := strconv.Atoi(valueStr)
-	if err != nil {
-		return defaultValue
-	}
-	return value
-}
-
-// Helper function to get environment variable as bool with a default value
-func getEnvAsBool(key string, defaultValue bool) bool {
-	valueStr := getEnv(key, "")
-	if valueStr == "" {
-		return defaultValue
-	}
-	value, err := strconv.ParseBool(valueStr)
-	if err != nil {
-		return defaultValue
-	}
-	return value
-}
-
-// createTopicFromPath converts an HTTP path to a Redis topic by replacing slashes
-func createTopicFromPath(path string) string {
-	// Remove leading slash if present
-	if strings.HasPrefix(path, "/") {
-		path = path[1:]
-	}
-	// Replace slashes with Redis separator (typically ":")
-	return strings.ReplaceAll(path, "/", ":")
-}
-
-// debugLog logs messages when in debug mode
-func debugLog(config Config, format string, v ...interface{}) {
-	if config.Debug {
-		log.Printf("[DEBUG] "+format, v...)
-	}
-}
-
-// Helper function to truncate long strings for logging
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
-}
-
-// extractResponseBody attempts to extract a response body from various formats
-func extractResponseBody(payload string) (interface{}, error) {
-	// First, try standard Response format
-	var response Response
-	if err := json.Unmarshal([]byte(payload), &response); err == nil {
-		if response.Body != nil {
-			return response.Body, nil
-		}
-	}
-
-	// Try parsing as direct JSON object
-	var directJSON interface{}
-	if err := json.Unmarshal([]byte(payload), &directJSON); err == nil {
-		return directJSON, nil
-	}
-
-	// If we can't parse it as JSON at all, return the raw string
-	return payload, nil
-}
-
-// handleRequest processes incoming HTTP requests
-func handleRequest(w http.ResponseWriter, r *http.Request, config Config, redisClient *redis.Client) {
-	ctx := context.Background()
-	requestID := uuid.New().String()
-
-	debugLog(config, "[%s] Received request: %s %s", requestID, r.Method, r.URL.Path)
-
-	// Read request body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("[%s] Error reading request body: %v", requestID, err)
-		http.Error(w, "Error reading request body", http.StatusBadRequest)
-		return
-	}
-
-	debugLog(config, "[%s] Request body length: %d bytes", requestID, len(body))
-
-	// Prepare headers map
-	headers := make(map[string]interface{})
-	for key, values := range r.Header {
-		if len(values) == 1 {
-			headers[key] = values[0]
-		} else {
-			headers[key] = values
-		}
-	}
-
-	// Add query parameters to headers
-	queryParams := r.URL.Query()
-	for key, values := range queryParams {
-		if len(values) == 1 {
-			headers["query_"+key] = values[0]
-		} else {
-			headers["query_"+key] = values
-		}
-	}
-
-	// Add path and method to headers
-	headers["path"] = r.URL.Path
-	headers["method"] = r.Method
-	headers["request_id"] = requestID
-
-	// Create message
-	var bodyData interface{}
-	if len(body) > 0 {
-		if err := json.Unmarshal(body, &bodyData); err != nil {
-			// If not valid JSON, use as string
-			bodyData = string(body)
-			debugLog(config, "[%s] Body is not valid JSON, using as string", requestID)
-		} else {
-			debugLog(config, "[%s] Body parsed as JSON", requestID)
-		}
-	}
-
-	message := Message{
-		Header: headers,
-		Body:   bodyData,
-	}
-
-	// Determine the topic to publish to
-	var topic string
-	if config.FixedTopic != "" {
-		topic = config.FixedTopic
-		debugLog(config, "[%s] Using fixed topic: %s", requestID, topic)
-	} else {
-		// Use the path but replace slashes with Redis separator
-		topic = createTopicFromPath(r.URL.Path)
-		debugLog(config, "[%s] Using path-based topic: %s", requestID, topic)
-	}
-
-	// Generate a unique response topic
-	responseID := uuid.New().String()
-	responseTopic := fmt.Sprintf("%s:response:%s", topic, responseID)
-
-	debugLog(config, "[%s] Response topic: %s", requestID, responseTopic)
-
-	// Add the response topic to the message headers
-	message.Header["response_topic"] = responseTopic
-
-	// Marshal the message to JSON
-	messageJSON, err := json.Marshal(message)
-	if err != nil {
-		log.Printf("[%s] Error creating message: %v", requestID, err)
-		http.Error(w, "Error creating message", http.StatusInternalServerError)
-		return
-	}
-
-	// If configured to respond immediately, do so and return
-	if config.RespondImmediatelyStatus > 0 {
-		debugLog(config, "[%s] Publishing message to topic: %s", requestID, topic)
-
-		// Publish the message to Redis
-		err = redisClient.Publish(ctx, topic, messageJSON).Err()
+	if dbLogPath != "" && dbMaxEntries > 0 {
+		dbLogger, err = NewDBLogger(dbLogPath, dbMaxEntries)
 		if err != nil {
-			log.Printf("[%s] Error publishing to Redis: %v", requestID, err)
-			http.Error(w, "Error publishing to Redis", http.StatusInternalServerError)
-			return
+			log.Error().Err(err).Msg("Failed to initialize DB logger")
+		} else {
+			log.Info().Str("path", dbLogPath).Int("maxEntries", dbMaxEntries).
+				Msg("DB logger initialized successfully")
+			defer dbLogger.Close()
 		}
-
-		debugLog(config, "[%s] Message published successfully", requestID)
-		debugLog(config, "[%s] Responding immediately with status code: %d", requestID, config.RespondImmediatelyStatus)
-		w.WriteHeader(config.RespondImmediatelyStatus)
-		return
+	} else {
+		log.Info().Msg("DB logging disabled")
 	}
 
-	// At this point, we know we need to wait for a response
-	debugLog(config, "[%s] Setting up response handler for topic: %s", requestID, responseTopic)
-
-	// Create a timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(config.ResponseTimeout)*time.Second)
-	defer cancel()
-
-	// Subscribe to the response topic BEFORE publishing the message
-	pubsub := redisClient.Subscribe(ctx, responseTopic)
-	defer pubsub.Close()
-
-	// Make sure subscription is established before waiting for messages
-	if _, err := pubsub.Receive(ctx); err != nil {
-		log.Printf("[%s] Error establishing subscription: %v", requestID, err)
-		http.Error(w, "Error connecting to response channel", http.StatusInternalServerError)
-		return
+	// Start the appropriate server(s) based on command line flags
+	if dashboardOnly && proxyOnly {
+		log.Fatal().Msg("Cannot specify both -proxy-only and -dashboard-only")
 	}
 
-	debugLog(config, "[%s] Subscription to response topic established", requestID)
+	// Create a WaitGroup to manage server shutdown
+	var wg sync.WaitGroup
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
 
-	// Set up channels for message handling
-	msgChan := make(chan *redis.Message)
-	errChan := make(chan error)
+	// Start appropriate servers based on flags
+	if dashboardOnly {
+		// Dashboard-only mode
+		log.Info().
+			Int("dashboardPort", dashboardConfig.Port).
+			Str("dbLogPath", dbLogPath).
+			Bool("debug", dashboardConfig.Debug).
+			Str("logLevel", dashboardConfig.LogLevel.String()).
+			Msg("Starting Dashboard server only")
 
-	// Start the goroutine to listen for messages BEFORE publishing
+		runDashboardOnly(dashboardConfig, dbLogger, shutdownCh)
+	} else if proxyOnly {
+		// Proxy-only mode
+		log.Info().
+			Str("redisAddr", proxyConfig.RedisAddr).
+			Int("redisPoolSize", proxyConfig.RedisPoolSize).
+			Int("proxyPort", proxyConfig.Port).
+			Str("fixedTopic", proxyConfig.FixedTopic).
+			Int("respondImmediately", proxyConfig.RespondImmediatelyStatus).
+			Int("responseTimeout", proxyConfig.ResponseTimeout).
+			Bool("debug", proxyConfig.Debug).
+			Str("logLevel", proxyConfig.LogLevel.String()).
+			Msg("Starting Redis proxy server only")
+
+		runProxyOnly(proxyConfig, dbLogger, shutdownCh, &wg)
+	} else {
+		// Default: run both servers
+		log.Info().
+			Str("redisAddr", proxyConfig.RedisAddr).
+			Int("redisPoolSize", proxyConfig.RedisPoolSize).
+			Int("proxyPort", proxyConfig.Port).
+			Int("dashboardPort", dashboardConfig.Port).
+			Str("fixedTopic", proxyConfig.FixedTopic).
+			Int("respondImmediately", proxyConfig.RespondImmediatelyStatus).
+			Int("responseTimeout", proxyConfig.ResponseTimeout).
+			Bool("debug", proxyConfig.Debug || dashboardConfig.Debug).
+			Str("logLevel", logLevel.String()).
+			Str("dbLogPath", dbLogPath).
+			Int("dbMaxEntries", dbMaxEntries).
+			Msg("Starting Redis proxy and Dashboard servers")
+
+		runBothServers(proxyConfig, dashboardConfig, dbLogger, shutdownCh, &wg)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	log.Info().Msg("All servers stopped. Exiting.")
+}
+
+// runDashboardOnly runs just the dashboard server
+func runDashboardOnly(config DashboardConfig, dbLogger *DBLogger, shutdownCh chan os.Signal) {
+	// Create and start the dashboard server
+	dashboardServer := NewDashboardServer(config, dbLogger)
+
+	// Start in a goroutine for signal handling
+	serverErrCh := make(chan error, 1)
 	go func() {
-		ch := pubsub.Channel()
-		debugLog(config, "[%s] Started goroutine to listen for messages", requestID)
-
-		select {
-		case msg := <-ch:
-			debugLog(config, "[%s] Received message from channel: %s", requestID, msg.Channel)
-			msgChan <- msg
-		case <-timeoutCtx.Done():
-			errChan <- timeoutCtx.Err()
-		}
+		serverErrCh <- dashboardServer.Start()
 	}()
 
-	// NOW publish the message to Redis after the listener is set up
-	debugLog(config, "[%s] Publishing message to topic: %s", requestID, topic)
-
-	err = redisClient.Publish(ctx, topic, messageJSON).Err()
-	if err != nil {
-		log.Printf("[%s] Error publishing to Redis: %v", requestID, err)
-		http.Error(w, "Error publishing to Redis", http.StatusInternalServerError)
-		return
-	}
-
-	debugLog(config, "[%s] Message published successfully", requestID)
-	debugLog(config, "[%s] Waiting for response on topic: %s with timeout: %d seconds",
-		requestID, responseTopic, config.ResponseTimeout)
-
-	// Wait for either a message, an error, or a timeout
+	// Wait for a shutdown signal or server error
 	select {
-	case msg := <-msgChan:
-		debugLog(config, "[%s] Processing received message from topic: %s", requestID, msg.Channel)
-		debugLog(config, "[%s] Message payload: %s", requestID, msg.Payload)
-
-		// Extract response body with more flexible handling
-		responseBody, err := extractResponseBody(msg.Payload)
-		if err != nil {
-			log.Printf("[%s] Error parsing response: %v", requestID, err)
-			log.Printf("[%s] Raw response: %s", requestID, msg.Payload)
-			http.Error(w, "Error parsing response", http.StatusInternalServerError)
-			return
+	case err := <-serverErrCh:
+		if err != nil && err.Error() != "http: Server closed" {
+			log.Error().Err(err).Msg("Dashboard server error")
 		}
+	case <-shutdownCh:
+		log.Info().Msg("Shutdown signal received, stopping dashboard server...")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(config.ShutdownTimeout)*time.Second)
+		defer cancel()
 
-		debugLog(config, "[%s] Response processed successfully", requestID)
-
-		// Send the response body back to the client
-		w.Header().Set("Content-Type", "application/json")
-		responseJSON, err := json.Marshal(responseBody)
-		if err != nil {
-			log.Printf("[%s] Error formatting response: %v", requestID, err)
-			http.Error(w, "Error formatting response", http.StatusInternalServerError)
-			return
+		if err := dashboardServer.Shutdown(ctx); err != nil {
+			log.Error().Err(err).Msg("Dashboard server shutdown error")
 		}
-
-		debugLog(config, "[%s] Writing response to client", requestID)
-		w.Write(responseJSON)
-		debugLog(config, "[%s] Response sent to client successfully", requestID)
-
-	case err := <-errChan:
-		log.Printf("[%s] Error receiving message: %v", requestID, err)
-		http.Error(w, "Error receiving response", http.StatusInternalServerError)
-		return
-
-	case <-timeoutCtx.Done():
-		// Timeout occurred
-		log.Printf("[%s] Response timeout after %d seconds", requestID, config.ResponseTimeout)
-		http.Error(w, "Response timeout", http.StatusGatewayTimeout)
-		return
+		log.Info().Msg("Dashboard server gracefully stopped")
 	}
 }
 
-func main() {
-	// Load configuration
-	config := LoadConfigFromEnv()
-
-	// Configure logging
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	if config.Debug {
-		log.Println("[DEBUG] Debug mode enabled")
-	}
-
-	// Set up Redis client
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:     config.RedisAddr,
-		Password: config.RedisPassword,
-		DB:       config.RedisDB,
-	})
-
-	// Verify Redis connection
-	ctx := context.Background()
-	_, err := redisClient.Ping(ctx).Result()
+// runProxyOnly runs just the proxy server
+func runProxyOnly(config Config, dbLogger *DBLogger, shutdownCh chan os.Signal, wg *sync.WaitGroup) {
+	// Set up Redis manager
+	redisManager, err := NewRedisManager(config)
 	if err != nil {
-		log.Fatalf("Failed to connect to Redis: %v", err)
+		log.Fatal().Err(err).Msg("Failed to connect to Redis")
+	}
+	defer redisManager.Close()
+
+	// Create and start the proxy server
+	proxyServer := NewProxyServer(config, redisManager, wg, dbLogger)
+
+	// Start in a goroutine for signal handling
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- proxyServer.Start()
+	}()
+
+	// Wait for a shutdown signal or server error
+	select {
+	case err := <-serverErrCh:
+		if err != nil && err.Error() != "http: Server closed" {
+			log.Error().Err(err).Msg("Proxy server error")
+		}
+	case <-shutdownCh:
+		log.Info().Msg("Shutdown signal received, stopping proxy server...")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(config.ShutdownTimeout)*time.Second)
+		defer cancel()
+
+		if err := proxyServer.Shutdown(ctx); err != nil {
+			log.Error().Err(err).Msg("Proxy server shutdown error")
+		}
+		log.Info().Msg("Proxy server gracefully stopped")
+	}
+}
+
+// runBothServers runs both the proxy and dashboard servers
+func runBothServers(proxyConfig Config, dashboardConfig DashboardConfig, dbLogger *DBLogger, shutdownCh chan os.Signal, wg *sync.WaitGroup) {
+	// Set up Redis manager
+	redisManager, err := NewRedisManager(proxyConfig)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Failed to connect to Redis")
+	}
+	defer redisManager.Close()
+
+	// Create servers
+	proxyServer := NewProxyServer(proxyConfig, redisManager, wg, dbLogger)
+	dashboardServer := NewDashboardServer(dashboardConfig, dbLogger)
+
+	// Start servers in separate goroutines
+	proxyErrCh := make(chan error, 1)
+	dashboardErrCh := make(chan error, 1)
+
+	go func() {
+		log.Info().Int("port", proxyConfig.Port).Msg("Starting HTTP proxy server")
+		proxyErrCh <- proxyServer.Start()
+	}()
+
+	go func() {
+		log.Info().Int("port", dashboardConfig.Port).Msg("Starting Dashboard server")
+		dashboardErrCh <- dashboardServer.Start()
+	}()
+
+	// Wait for shutdown signal or server errors
+	select {
+	case err := <-proxyErrCh:
+		if err != nil && err.Error() != "http: Server closed" {
+			log.Error().Err(err).Msg("Proxy server error, shutting down both servers")
+		}
+	case err := <-dashboardErrCh:
+		if err != nil && err.Error() != "http: Server closed" {
+			log.Error().Err(err).Msg("Dashboard server error, shutting down both servers")
+		}
+	case <-shutdownCh:
+		log.Info().Msg("Shutdown signal received, stopping all servers...")
 	}
 
-	debugLog(config, "Successfully connected to Redis at %s", config.RedisAddr)
+	// Create a context with timeout for shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(proxyConfig.ShutdownTimeout)*time.Second)
+	defer cancel()
 
-	// Set up HTTP server
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleRequest(w, r, config, redisClient)
-	})
-
-	// Start server
-	serverAddr := fmt.Sprintf(":%d", config.Port)
-	log.Printf("Starting HTTP server on %s", serverAddr)
-	log.Printf("Redis proxy configuration: RedisAddr=%s, FixedTopic=%s, RespondImmediately=%d, Timeout=%ds, Debug=%v",
-		config.RedisAddr, config.FixedTopic, config.RespondImmediatelyStatus, config.ResponseTimeout, config.Debug)
-
-	if err := http.ListenAndServe(serverAddr, nil); err != nil {
-		log.Fatalf("HTTP server error: %v", err)
+	// Shutdown both servers
+	if err := proxyServer.Shutdown(ctx); err != nil {
+		log.Error().Err(err).Msg("Proxy server shutdown error")
 	}
+
+	if err := dashboardServer.Shutdown(ctx); err != nil {
+		log.Error().Err(err).Msg("Dashboard server shutdown error")
+	}
+
+	log.Info().Msg("All servers gracefully stopped")
 }

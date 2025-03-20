@@ -1,4 +1,3 @@
-# docker-compose.yml
 version: '3'
 
 services:
@@ -18,22 +17,23 @@ services:
   redis-proxy:
     build: .
     ports:
-      - "8080:8080"
+      - "8080:8080"  # Proxy port
+      - "8081:8081"  # Dashboard port
     environment:
       - REDIS_ADDR=redis:6379
       - REDIS_PASSWORD=
       - REDIS_DB=0
+      - REDIS_POOL_SIZE=10
       - PORT=8080
-      # Uncomment one of these configurations:
+      - DASHBOARD_PORT=8081
+      # Database logging for dashboard
+      - DB_LOG_PATH=/app/data/proxy-logs.db
+      - DB_MAX_ENTRIES=5000
+      # Operation mode (uncomment one configuration)
       
       # For sync mode with path-based topics:
-      # - RESPONSE_TIMEOUT=30
-      # - DEBUG=true
-      
-      # For sync mode with fixed topic:
-      - FIXED_TOPIC=incoming-messages
       - RESPONSE_TIMEOUT=30
-      - DEBUG=true
+      # - FIXED_TOPIC=incoming-messages
       
       # For async mode with path-based topics:
       # - RESPOND_IMMEDIATELY_STATUS_CODE=201
@@ -41,6 +41,12 @@ services:
       # For async mode with fixed topic:
       # - FIXED_TOPIC=incoming-messages
       # - RESPOND_IMMEDIATELY_STATUS_CODE=201
+      
+      # Debug settings
+      - DEBUG=true
+      - DASHBOARD_DEBUG=true
+    volumes:
+      - proxy-data:/app/data
     depends_on:
       redis:
         condition: service_healthy
@@ -65,4 +71,5 @@ services:
     restart: always
 
 volumes:
-  redis-data:
+  redis-data:  # Persistent Redis data
+  proxy-data:  # Persistent database storage

@@ -1,9 +1,12 @@
-# Dockerfile
-FROM golang:1.20-alpine AS builder
+# Build stage
+FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# Copy go mod and sum files
+# Install required dependencies
+RUN apk add --no-cache gcc musl-dev
+
+# Copy go mod files
 COPY go.mod go.sum ./
 
 # Download all dependencies
@@ -12,21 +15,25 @@ RUN go mod download
 # Copy the source code
 COPY *.go ./
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
+# Build the application with SQLite support
+RUN CGO_ENABLED=1 GOOS=linux go build -a -tags netgo -ldflags '-w -extldflags "-static"' -o redis-proxy .
 
-# Use a smaller image for the final container
+# Final stage
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates
+# Install ca-certificates for HTTPS and SQLite libraries
+RUN apk --no-cache add ca-certificates sqlite-libs
 
-WORKDIR /root/
+# Create directory for storing database
+RUN mkdir -p /app/data
 
-# Copy the executable from the builder stage
-COPY --from=builder /app/main .
+WORKDIR /app
 
-# Expose the default port
-EXPOSE 8080
+# Copy the binary from the builder stage
+COPY --from=builder /app/redis-proxy .
 
-# Command to run
-CMD ["./main"]
+# Expose proxy and dashboard ports
+EXPOSE 8080 8081
+
+# Set up entrypoint
+ENTRYPOINT ["./redis-proxy"]

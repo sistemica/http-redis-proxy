@@ -1,99 +1,89 @@
-# Simple Makefile for Redis HTTP Proxy
-# Run different configurations with "go run ."
+# Redis HTTP Proxy with Dashboard
+# This Makefile always enables the dashboard on port 8081
 
-# Default run - synchronous mode with path-based topics
+# Default configuration - run both proxy and dashboard
 run:
-	go run .
-
-# Run in synchronous mode with path-based topics
-run-sync:
 	PORT=8080 \
+	DASHBOARD_PORT=8081 \
 	REDIS_ADDR=localhost:6379 \
 	REDIS_PASSWORD= \
 	REDIS_DB=0 \
 	RESPONSE_TIMEOUT=30 \
+	DB_LOG_PATH=./proxy-logs.db \
+	DB_MAX_ENTRIES=1000 \
 	go run .
 
-run-sync-debug:
-	PORT=8080 \
-	REDIS_ADDR=localhost:6379 \
-	REDIS_PASSWORD= \
-	REDIS_DB=0 \
-	RESPONSE_TIMEOUT=30 \
-	DEBUG=true \
-	go run .
-
-# Run in asynchronous mode with path-based topics
-run-async:
-	PORT=8080 \
-	REDIS_ADDR=localhost:6379 \
-	REDIS_PASSWORD= \
-	REDIS_DB=0 \
-	RESPOND_IMMEDIATELY_STATUS_CODE=201 \
-	go run .
-
-# Run in synchronous mode with fixed topic
-run-sync-fixed:
-	PORT=8080 \
-	REDIS_ADDR=localhost:6379 \
-	REDIS_PASSWORD= \
-	REDIS_DB=0 \
-	FIXED_TOPIC=incoming-messages \
-	RESPONSE_TIMEOUT=30 \
-	go run .
-
-# Run in synchronous mode with fixed topic and debug logging
-run-sync-fixed-debug:
-	PORT=8080 \
-	REDIS_ADDR=localhost:6379 \
-	REDIS_PASSWORD= \
-	REDIS_DB=0 \
-	FIXED_TOPIC=incoming-messages \
-	RESPONSE_TIMEOUT=30 \
-	DEBUG=true \
-	go run .
-
-# Run in asynchronous mode with fixed topic
-run-async-fixed:
-	PORT=8080 \
-	REDIS_ADDR=localhost:6379 \
-	REDIS_PASSWORD= \
-	REDIS_DB=0 \
-	FIXED_TOPIC=incoming-messages \
-	RESPOND_IMMEDIATELY_STATUS_CODE=201 \
-	go run .
-
-# Run with debug logging
+# Run with debug logging enabled
 run-debug:
 	PORT=8080 \
+	DASHBOARD_PORT=8081 \
 	REDIS_ADDR=localhost:6379 \
 	REDIS_PASSWORD= \
 	REDIS_DB=0 \
 	RESPONSE_TIMEOUT=30 \
+	DB_LOG_PATH=./proxy-logs.db \
+	DB_MAX_ENTRIES=1000 \
 	DEBUG=true \
+	DASHBOARD_DEBUG=true \
 	go run .
 
-# Run on a different port
-run-alt-port:
-	PORT=9090 \
+# Run with fixed topic
+run-fixed-topic:
+	PORT=8080 \
+	DASHBOARD_PORT=8081 \
 	REDIS_ADDR=localhost:6379 \
 	REDIS_PASSWORD= \
 	REDIS_DB=0 \
+	FIXED_TOPIC=incoming-messages \
+	RESPONSE_TIMEOUT=30 \
+	DB_LOG_PATH=./proxy-logs.db \
+	DB_MAX_ENTRIES=1000 \
 	go run .
+
+# Run in asynchronous mode (fire-and-forget)
+run-async:
+	PORT=8080 \
+	DASHBOARD_PORT=8081 \
+	REDIS_ADDR=localhost:6379 \
+	REDIS_PASSWORD= \
+	REDIS_DB=0 \
+	RESPOND_IMMEDIATELY_STATUS_CODE=201 \
+	DB_LOG_PATH=./proxy-logs.db \
+	DB_MAX_ENTRIES=1000 \
+	go run .
+
+# Run on different ports
+run-alt-ports:
+	PORT=9090 \
+	DASHBOARD_PORT=9091 \
+	REDIS_ADDR=localhost:6379 \
+	REDIS_PASSWORD= \
+	REDIS_DB=0 \
+	RESPONSE_TIMEOUT=30 \
+	DB_LOG_PATH=./proxy-logs.db \
+	DB_MAX_ENTRIES=1000 \
+	go run .
+
+# Build the application
+build:
+	go build -o redis-proxy .
+
+# Clean build artifacts
+clean:
+	rm -f redis-proxy proxy-logs.db
 
 # Display help information
 help:
-	@echo "Redis HTTP Proxy - Simple Makefile"
+	@echo "Redis HTTP Proxy with Dashboard - Makefile"
 	@echo ""
 	@echo "Available commands:"
-	@echo "  make run                  Run in default mode (synchronous with path-based topics)"
-	@echo "  make run-sync             Run in synchronous mode with path-based topics"
-	@echo "  make run-async            Run in asynchronous mode with path-based topics"
-	@echo "  make run-sync-fixed       Run in synchronous mode with fixed topic"
-	@echo "  make run-sync-fixed-debug Run in synchronous mode with fixed topic and debug logging"
-	@echo "  make run-async-fixed      Run in asynchronous mode with fixed topic"
-	@echo "  make run-debug            Run with debug logging enabled"
-	@echo "  make run-alt-port         Run on alternate port (9090)"
-	@echo "  make help                 Display this help information"
+	@echo "  make run              Run proxy (port 8080) and dashboard (port 8081)"
+	@echo "  make run-debug        Run with debug logging enabled"
+	@echo "  make run-fixed-topic  Run with fixed topic 'incoming-messages'"
+	@echo "  make run-async        Run in asynchronous mode (fire-and-forget)"
+	@echo "  make run-alt-ports    Run on ports 9090 (proxy) and 9091 (dashboard)"
+	@echo "  make build            Build the application"
+	@echo "  make clean            Clean build artifacts"
+	@echo "  make help             Display this help information"
 
-.PHONY: run run-sync run-async run-sync-fixed run-sync-fixed-debug run-async-fixed run-debug run-alt-port help
+.PHONY: run run-debug run-fixed-topic run-async run-alt-ports build clean help
