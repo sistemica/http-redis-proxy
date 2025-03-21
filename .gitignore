@@ -25,3 +25,5 @@ go.work.sum
 .env
 summary.txt
 scripts/
+
+proxy-logs.db
